@@ -1,6 +1,7 @@
 //! Photoshop's on-canvas brush resize (#231, #297): with a painting tool, Alt+right-drag
-//! (Windows, Linux) or Control+Option+drag (macOS; Control+Alt+drag works everywhere) changes the
-//! brush instead of painting. Left and right
+//! (Windows, Linux; the stylus barrel counts as the right button) or Control+Option+drag (macOS)
+//! changes the brush instead of painting. Off the Mac, Control+Alt on the left button is
+//! Photoshop's duplicate move (the temporary Move with ⌥), not this resize. Left and right
 //! set the diameter (the circle's edge follows the pointer), up and down the hardness (down makes
 //! it harder). The brush circle stays where the drag began, tinted to show the hardness, with a
 //! Diameter/Hardness readout beside the pointer.
@@ -43,9 +44,13 @@ pub fn applies(tool: Tool) -> bool {
     tool.is_brushlike() || tool == Tool::QuickSelection
 }
 
-/// Control+Alt (Control+Option on a Mac): `ctrl` is the Control key on every platform.
+/// Control+Option+drag: the HUD resize on macOS (`ctrl` is the Control key on every platform).
+/// Off the Mac Photoshop gives Control+Alt on the left button to the duplicate move instead —
+/// the temporary Move (`hold_keys`) with ⌥, which `move_mods` duplicates — so the resize there
+/// is the Alt+right-drag (`is_right_gesture`, #297) alone; a ⌘ alongside (Windows' Ctrl also
+/// sets `command`) is that duplicate move, never this gesture.
 pub fn is_gesture(mods: egui::Modifiers) -> bool {
-    mods.ctrl && mods.alt
+    cfg!(target_os = "macos") && mods.ctrl && mods.alt && !mods.command
 }
 
 /// Alt (Option) with the right button: Photoshop's Windows gesture (#297). The left button with
@@ -65,9 +70,9 @@ pub fn resized(start: (f32, f32), dx: f64, dy: f64, zoom: f32) -> (f32, f32) {
     (size, (hardness * 100.0).round() / 100.0)
 }
 
-/// Route a tool event: true when it belongs to a resize drag (begun here with Control+Alt held,
-/// or an Alt+right-drag `armed` for this press, or already in progress), so the tool never sees
-/// it.
+/// Route a tool event: true when it belongs to a resize drag (the Alt+right-drag `armed` for
+/// this press, the Mac's Control+Option+left-drag, or one already in progress), so the tool
+/// never sees it.
 pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers, armed: bool) -> bool {
     static KEY: AtomicU64 = AtomicU64::new(0);
     match ev {
@@ -228,23 +233,26 @@ mod tests {
         assert_eq!(resized((40.0, 0.5), -1e9, -1e9, 1.0), (1.0, 0.0));
         assert_eq!(resized((40.0, 0.5), 1e9, 1e9, 1.0), (MAX_BRUSH_SIZE, 1.0));
         assert_eq!(resized((40.0, 0.5), f64::NAN, f64::INFINITY, f32::NAN), (40.0, 0.5));
-        assert!(is_gesture(CTRL_ALT) && !is_gesture(Modifiers::ALT) && !is_gesture(Modifiers::CTRL) && !is_gesture(Modifiers::SHIFT));
+        assert_eq!(is_gesture(CTRL_ALT), cfg!(target_os = "macos"), "the left-button HUD drag stays on the Mac; off it Ctrl+Alt duplicates (hold_keys)");
+        assert!(!is_gesture(Modifiers::ALT) && !is_gesture(Modifiers::CTRL) && !is_gesture(Modifiers::SHIFT));
     }
 
     #[test]
-    fn ctrl_alt_drag_resizes_every_brush_tool_without_painting_or_history() {
+    fn an_armed_drag_resizes_every_brush_tool_without_painting_or_history() {
         let tools: Vec<Tool> = Tool::ALL.into_iter().filter(|t| applies(*t)).collect();
         assert!(tools.len() > 10 && tools.contains(&Tool::Brush) && tools.contains(&Tool::Eraser) && tools.contains(&Tool::CloneStamp));
         for tool in tools {
             let mut app = app(tool);
             let (h0, j0) = (history(&app), app.session.journal.len());
-            tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, CTRL_ALT);
+            // The Alt+right-drag's arming (`paint_mouse`) is what canvas hands to `pointer`.
+            app.brush_resize_armed = true;
+            tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, Modifiers::ALT);
             assert!(app.brush_resize.is_some() && app.drag.is_none(), "{tool:?}");
             // Right grows the size.
-            tool_event(&mut app, ToolEvent::Move { x: 130.0, y: 100.0, pressure: 1.0 }, CTRL_ALT);
+            tool_event(&mut app, ToolEvent::Move { x: 130.0, y: 100.0, pressure: 1.0 }, Modifiers::ALT);
             assert_eq!(app.session.tools.brush.size, 100.0, "{tool:?}");
             // Down raises the hardness (at 100 %, 200 points take it from 0 to 100 %).
-            tool_event(&mut app, ToolEvent::Move { x: 130.0, y: 160.0, pressure: 1.0 }, CTRL_ALT);
+            tool_event(&mut app, ToolEvent::Move { x: 130.0, y: 160.0, pressure: 1.0 }, Modifiers::ALT);
             assert_eq!(app.session.tools.brush.hardness, 0.5, "{tool:?}");
             // Letting go of the keys mid-drag keeps resizing until the button is released.
             tool_event(&mut app, ToolEvent::Up { x: 120.0, y: 180.0 }, Modifiers::NONE);
@@ -292,10 +300,10 @@ mod tests {
         h.run_steps(4);
         let c = h.state().last_canvas_rect.center();
         let press = |h: &mut Harness<'static, PhotocraftApp>, pos: Pos2, pressed: bool| {
-            h.event(egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: CTRL_ALT });
+            h.event(egui::Event::PointerButton { pos, button: PointerButton::Secondary, pressed, modifiers: Modifiers::ALT });
             h.run();
         };
-        h.event(egui::Event::ModifiersChanged(CTRL_ALT));
+        h.event(egui::Event::ModifiersChanged(Modifiers::ALT));
         h.event(egui::Event::PointerMoved(c));
         h.run();
         press(&mut h, c, true);
@@ -499,9 +507,10 @@ mod tests {
                 app.run("prefs.set", json!({"path": "tools.varyRoundBrushHardnessOnHud", "value": false})).unwrap();
             }
             let (h0, o0) = (app.session.tools.brush.hardness, app.session.tools.brush.opacity);
-            tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, CTRL_ALT);
-            tool_event(&mut app, ToolEvent::Move { x: 100.0, y: 140.0, pressure: 1.0 }, CTRL_ALT);
-            tool_event(&mut app, ToolEvent::Up { x: 100.0, y: 140.0 }, CTRL_ALT);
+            app.brush_resize_armed = true;
+            tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, Modifiers::ALT);
+            tool_event(&mut app, ToolEvent::Move { x: 100.0, y: 140.0, pressure: 1.0 }, Modifiers::ALT);
+            tool_event(&mut app, ToolEvent::Up { x: 100.0, y: 140.0 }, Modifiers::ALT);
             let b = &app.session.tools.brush;
             if vary {
                 assert_eq!((b.hardness, b.opacity), (h0 + 0.2, o0), "hardness moves with the drag");
@@ -520,8 +529,9 @@ mod tests {
         app.sync_views();
         app.ui.views[0].rotation = rotation;
         app.ui.view.flip_horizontal = flip;
-        tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, CTRL_ALT);
-        tool_event(&mut app, ToolEvent::Up { x: 100.0 + dx, y: 100.0 + dy }, CTRL_ALT);
+        app.brush_resize_armed = true;
+        tool_event(&mut app, ToolEvent::Down { x: 100.0, y: 100.0, pressure: 1.0 }, Modifiers::ALT);
+        tool_event(&mut app, ToolEvent::Up { x: 100.0 + dx, y: 100.0 + dy }, Modifiers::ALT);
         let b = &app.session.tools.brush;
         (b.size, b.hardness)
     }

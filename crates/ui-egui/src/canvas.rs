@@ -4726,6 +4726,12 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             if tool == Tool::Move {
                 return crate::rulers::guide_at(app, d[0], d[1]);
             }
+            // A held temporary Hand / Zoom tool (Space, ⌘Space, ⌥Space, and the Hand's ⌘ / ⌥): the
+            // frame's tool is that tool's, ⌘ is the key's own gesture and not the Move tool's, so
+            // a guide under the pointer shows no guide cursor (its press would not move one).
+            if temporary.is_some() {
+                return None;
+            }
             command_guide_at(app, tool, d, crate::workspace_ui::sticky_mods(app, ui.input(|i| i.modifiers)))
         });
         if panning {
@@ -4942,8 +4948,19 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                 {
                     egui::CursorIcon::Crosshair
                 }
-                // Photoshop's Move tool keeps the standard arrow pointer (#5646): the movable
-                // layer under it is marked by the hover outline, not by a different cursor.
+                // Photoshop shows the Move function in the pointer: held ⌘ (Ctrl off the Mac)
+                // or a live Move-tool drag gives the four-arrow move icon, and ⌥ on that press
+                // makes it the white-and-black duplicate pair. At rest the Move tool keeps the
+                // standard arrow pointer (#5646): the movable layer under it is marked by the
+                // hover outline, not by a different cursor.
+                Tool::Move if move_pointer(app, temporary) => {
+                    if move_pointer_copy(app, crate::workspace_ui::sticky_mods(app, ui.input(|i| i.modifiers))) {
+                        crate::icons::cursor_copy_pointer(ui.ctx(), p);
+                    } else {
+                        crate::icons::cursor(ui.ctx(), "move", p, vec2(0.5, 0.5), 22.0);
+                    }
+                    egui::CursorIcon::None
+                }
                 Tool::Move => egui::CursorIcon::Default,
                 // Dragging is handled with the pan itself, above.
                 Tool::Hand => crate::tool_cursor::hand(ui.ctx(), false),
@@ -4965,6 +4982,19 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
                         painter.line_segment([p - vec2(3.0, 0.0), p + vec2(3.0, 0.0)], Stroke::new(w, c));
                         painter.line_segment([p - vec2(0.0, 3.0), p + vec2(0.0, 3.0)], Stroke::new(w, c));
                     }
+                    egui::CursorIcon::None
+                }
+                // Photoshop's selection pointers: the lasso family and the Object Selection tool
+                // keep the crosshair and show their tool glyph beside it; the Magic Wand is its
+                // own pointer, the wand tip on the point. Other Cursors: Precise (and ⇪) stays the
+                // bare crosshair, as for the pens and the bucket (#4639's rule).
+                Tool::Lasso | Tool::PolygonLasso | Tool::ObjectSelection if !precise_other_cursor(app) => {
+                    let cross = crate::tool_cursor::crosshair(&painter, p, 6.0, 0.0);
+                    crate::icons::cursor_badge(ui.ctx(), crate::icons::tool_icon(tool), p);
+                    cross
+                }
+                Tool::MagicWand if !precise_other_cursor(app) => {
+                    crate::icons::cursor(ui.ctx(), "wand-sparkles", p, egui::vec2(3.0, 21.0) / 24.0, 22.0);
                     egui::CursorIcon::None
                 }
                 _ => egui::CursorIcon::Crosshair,
@@ -5856,7 +5886,8 @@ fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &View
 /// Tools on which holding ⌥ (Alt) switches to the Eyedropper: a click or drag sets the
 /// foreground colour, as with the Eyedropper itself (#417).
 pub(crate) fn alt_samples(tool: Tool, mods: egui::Modifiers) -> bool {
-    // Control+Alt is the brush-resize drag (`brush_resize`), not sampling.
+    // Control+Alt with a brush tool is the duplicate move off the Mac (the temporary Move with
+    // ⌥) and the HUD resize on it (`brush_resize`); either way, not sampling.
     mods.alt && !mods.ctrl && matches!(tool, Tool::Brush | Tool::Pencil | Tool::Gradient | Tool::PaintBucket)
 }
 
@@ -5864,6 +5895,18 @@ pub(crate) fn alt_samples(tool: Tool, mods: egui::Modifiers) -> bool {
 /// standard cursor for it (and back), as in Photoshop (#4639).
 fn precise_other_cursor(app: &PhotocraftApp) -> bool {
     (app.session.prefs().cursors.other == photocraft_engine::prefs::OtherCursor::Precise) != app.caps_lock
+}
+
+/// Is the Move function showing in the pointer this frame: held ⌘ (the temporary Move,
+/// `hold_keys`) or a live Move-tool drag?
+pub(crate) fn move_pointer(app: &PhotocraftApp, temporary: Option<crate::hold_keys::Temporary>) -> bool {
+    temporary == Some(crate::hold_keys::Temporary::Move) || app.drag.as_ref().is_some_and(|d| d.tool == Tool::Move)
+}
+
+/// Does the pointer show the white-and-black duplicate pair: ⌥ held now, or on the press of the
+/// Move drag in progress?
+pub(crate) fn move_pointer_copy(app: &PhotocraftApp, held: egui::Modifiers) -> bool {
+    app.drag.as_ref().filter(|d| d.tool == Tool::Move).map_or(held.alt, |d| d.modifiers.alt)
 }
 
 /// A pen tool's standard cursor: its toolbar icon with the nib (the Convert Point tool: the

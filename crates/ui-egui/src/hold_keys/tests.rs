@@ -593,13 +593,33 @@ fn cmd_released_mid_drag_keeps_moving_until_the_button_comes_up() {
     assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Move"), "nothing erased");
 }
 
-/// ⌘⌥-drag duplicates the layer first and moves the copy, as the Move tool's ⌥-drag does. Off
-/// the Mac the same keys are Ctrl+Alt, which the Brush keeps for its on-canvas resize
-/// (`brush_resize`, Alt+right-drag there too), so Ctrl+Alt duplicates with the tools that have no
-/// brush to resize, such as the Gradient.
+/// ⌘ with the Zoom tool is the Move tool too (Adobe excepts only the Hand and shape tools from
+/// ⌘-as-Move): a ⌘-drag moves the layer and does not zoom; the Zoom tool is back when ⌘ comes up.
+#[test]
+fn cmd_drag_with_the_zoom_tool_is_the_move_tool() {
+    let mut h = harness(Tool::Zoom);
+    let id = with_layer(&mut h);
+    let zoom_before = h.state().ui.views[0].zoom;
+    h.event(Event::ModifiersChanged(platform(Modifiers::COMMAND)));
+    h.run_steps(1);
+    assert_eq!(held_tool(h.state(), &h.ctx), Some(Temporary::Move));
+    let steps = h.state().session.active().unwrap().history.past_len();
+    drag_with(&mut h, Modifiers::COMMAND, 130.0, 130.0, 170.0, 150.0);
+    assert_eq!(held_tool(h.state(), &h.ctx), None);
+    let st = h.state().session.active().unwrap();
+    assert_eq!(bounds(&h, id), Rect::new(140, 120, 200, 180), "the layer moved by (40, 20)");
+    assert_eq!(st.history.undo_label(), Some("Move"));
+    assert_eq!(st.history.past_len(), steps + 1, "one step: no zoom step");
+    assert_eq!(h.state().ui.views[0].zoom, zoom_before, "the ⌘-drag did not zoom");
+    assert_eq!(h.state().ui.tool, Tool::Zoom, "the Zoom tool is back");
+}
+
+/// ⌘⌥-drag duplicates the layer first and moves the copy, as the Move tool's ⌥-drag does — with
+/// every ⌘-as-Move tool including the Brush, as Photoshop does: the Brush's on-canvas resize is
+/// the Alt+right-drag (`brush_resize`, everywhere) and Control+Option+left-drag on macOS only.
 #[test]
 fn cmd_alt_drag_duplicates_the_layer_then_moves_the_copy() {
-    for (tool, mods) in [(Tool::Brush, MAC_CMD_ALT), (Tool::Gradient, MAC_CMD_ALT), (Tool::Gradient, CTRL_ALT)] {
+    for (tool, mods) in [(Tool::Brush, MAC_CMD_ALT), (Tool::Gradient, MAC_CMD_ALT), (Tool::Gradient, CTRL_ALT), (Tool::Brush, CTRL_ALT)] {
         let mut h = harness(tool);
         let orig = with_layer(&mut h);
         let n0 = h.state().session.active().unwrap().doc.layers.len();
@@ -615,23 +635,6 @@ fn cmd_alt_drag_duplicates_the_layer_then_moves_the_copy() {
         assert_eq!(st.history.undo_label(), Some(crate::move_mods::DUPLICATE_MOVE_LABEL));
         assert_eq!(h.state().ui.tool, tool);
     }
-}
-
-/// Off the Mac, Ctrl+Alt-drag with the Brush resizes the brush, as before ⌘ became the Move
-/// tool: no copy, no move, the layer untouched.
-#[test]
-fn ctrl_alt_drag_with_the_brush_resizes_it_off_the_mac() {
-    let mut h = harness(Tool::Brush);
-    let orig = with_layer(&mut h);
-    let n0 = h.state().session.active().unwrap().doc.layers.len();
-    let size0 = h.state().session.tools.brush.size;
-    drag_raw(&mut h, CTRL_ALT, 130.0, 130.0, 170.0, 150.0);
-    let st = h.state().session.active().unwrap();
-    assert_eq!(st.doc.layers.len(), n0, "no copy");
-    assert_eq!(st.active_layer, Some(orig));
-    assert_eq!(bounds(&h, orig), Rect::new(100, 100, 160, 160), "the layer stays");
-    assert_ne!(st.history.undo_label(), Some("Move"));
-    assert_ne!(h.state().session.tools.brush.size, size0, "the brush was resized");
 }
 
 /// With a selection, ⌘-drag with the Brush moves the selected pixels (a floating piece), as the
@@ -673,11 +676,10 @@ fn cmd_click_with_the_brush_picks_the_layer_under_the_pointer() {
 /// Tools that keep ⌘ for themselves, and the selection tools (their ⌘ is handled per press in
 /// `canvas`, #896), never become the Move tool this way.
 #[test]
-fn cmd_is_not_the_move_tool_for_selection_hand_zoom_pen_shape_or_type_tools() {
+fn cmd_is_not_the_move_tool_for_selection_hand_pen_shape_or_type_tools() {
     for tool in [
         Tool::Hand,
         Tool::RotateView,
-        Tool::Zoom,
         Tool::Pen,
         Tool::Rectangle,
         Tool::Type,
@@ -700,7 +702,8 @@ fn cmd_is_not_the_move_tool_for_selection_hand_zoom_pen_shape_or_type_tools() {
         let want = (tool == Tool::Hand).then_some(Temporary::ZoomIn);
         assert_eq!(held_tool(h.state(), &h.ctx), want, "{tool:?}");
     }
-    for tool in [Tool::Brush, Tool::Eraser, Tool::Gradient, Tool::CloneStamp, Tool::Eyedropper, Tool::MagneticLasso, Tool::QuickSelection] {
+    // The Zoom tool's ⌘ is the Move tool: Adobe excepts only the Hand and shape tools.
+    for tool in [Tool::Brush, Tool::Eraser, Tool::Gradient, Tool::CloneStamp, Tool::Eyedropper, Tool::MagneticLasso, Tool::QuickSelection, Tool::Zoom] {
         assert!(cmd_moves(tool), "{tool:?}");
     }
 }
