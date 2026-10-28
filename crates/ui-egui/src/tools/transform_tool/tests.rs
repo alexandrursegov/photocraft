@@ -4,6 +4,7 @@ fn session() -> TransformSession {
     TransformSession {
         session: 1,
         layer: 1,
+        layers: Vec::new(),
         rect: [0.0, 0.0, 100.0, 50.0],
         quad: corners([0.0, 0.0, 100.0, 50.0]),
         pivot: [50.0, 25.0],
@@ -1917,6 +1918,39 @@ fn app_with_square(size: u32, fill: photocraft_geom::Rect) -> PhotocraftApp {
         })
         .unwrap();
     app
+}
+
+/// Multi-layer Free Transform: with two layers selected, ⌘T boxes them as one set, and
+/// committing a doubled quad transforms both whole in one history step, exactly as the
+/// engine's set transform does.
+#[test]
+fn the_multi_box_transforms_both_layers_in_one_step() {
+    let mut app = app_with_square(100, photocraft_geom::Rect::new(10, 10, 30, 20));
+    let red = app.session.active().unwrap().active_layer.unwrap();
+    app.session.execute("layer.new.layer", json!({"name": "Blue"})).unwrap();
+    app.session
+        .edit("paint", |doc, a| {
+            doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(60, 60, 90, 90), &[0.0, 0.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+    let blue = app.session.active().unwrap().active_layer.unwrap();
+    app.session.execute("layer.select", json!({"layer": red.0, "mode": "replace"})).unwrap();
+    app.session.execute("layer.select", json!({"layer": blue.0, "mode": "add"})).unwrap();
+    let past = app.session.active().unwrap().history.past_len();
+    begin(&mut app, &egui::Context::default()).unwrap();
+    let t = app.ui.transform.as_ref().unwrap().clone();
+    assert_eq!(t.layers, vec![red.0, blue.0], "the session holds the whole set");
+    assert_eq!(t.rect, [10.0, 10.0, 90.0, 90.0], "the box is the set's shared frame");
+    // The doubled quad a two-corner drag would leave: 2x about the frame's centre (50, 50).
+    app.ui.transform.as_mut().unwrap().quad = [[-30.0, -30.0], [130.0, -30.0], [130.0, 130.0], [-30.0, 130.0]];
+    commit(&mut app);
+    assert!(app.ui.transform.is_none(), "the box closes on the commit");
+    let st = app.session.active().unwrap();
+    assert_eq!(st.history.past_len(), past + 1, "one history step for the set");
+    let bounds = |id: photocraft_doc::LayerId| st.doc.layer(id).unwrap().surface().unwrap().content_bounds();
+    assert_eq!(bounds(red), photocraft_geom::Rect::new(-30, -30, 10, -10), "the first scaled about the shared centre");
+    assert_eq!(bounds(blue), photocraft_geom::Rect::new(70, 70, 130, 130), "the second moved with it");
 }
 
 /// #2439: a layer under others keeps its place in the stack while the box is open. The

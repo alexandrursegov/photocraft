@@ -908,3 +908,132 @@ fn a_stroked_soft_shapes_frame_matches_the_hard_shapes() {
         assert_eq!(boxes(&s), hard, "{align} at {x}: Feather alone leaves the frame");
     }
 }
+
+// ---- Multi-layer Free Transform: several layers, one box, one history step. ----
+
+/// [`session`] plus a second painted layer: the first at (10,10)-(30,20), the second at
+/// (60,60)-(90,90). Returns the session and both layer ids.
+fn two_layers() -> (Session, LayerId, LayerId) {
+    let mut s = session();
+    s.execute("layer.new.layer", json!({"name": "Second"})).unwrap();
+    s.edit("paint", |doc, active| {
+        doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap().fill_rect(Rect::new(60, 60, 90, 90), &[0.0, 0.0, 1.0, 1.0]);
+        Ok(())
+    })
+    .unwrap();
+    let (a, b) = {
+        let st = s.active().unwrap();
+        (st.doc.layers[1].id, st.doc.layers[2].id)
+    };
+    (s, a, b)
+}
+
+/// Several selected layers scale by the same map about the union frame's centre, as
+/// Photoshop's multi-layer Free Transform does, and the whole set takes one history step.
+#[test]
+fn several_selected_layers_transform_as_one_step() {
+    let (mut s, a, b) = two_layers();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+    let past = s.active().unwrap().history.past_len();
+    s.execute("edit.transform", json!({"scaleX": 200, "scaleY": 200})).unwrap();
+    let bounds = |s: &Session, id: LayerId| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().content_bounds();
+    assert_eq!(s.active().unwrap().history.past_len(), past + 1, "one history step for the set");
+    // Union frame (10,10)-(90,90), centre (50,50): x' = 50 + 2·(x - 50).
+    assert_eq!(bounds(&s, a), Rect::new(-30, -30, 10, -10), "the first layer scaled about the shared centre");
+    assert_eq!(bounds(&s, b), Rect::new(70, 70, 130, 130), "the second moved with it");
+    assert!(s.undo());
+    assert_eq!(bounds(&s, a), Rect::new(10, 10, 30, 20), "one undo takes both layers back");
+    assert_eq!(bounds(&s, b), Rect::new(60, 60, 90, 90));
+}
+
+/// `"layers"` transforms the named set even while only one of them is selected.
+#[test]
+fn the_layers_param_transforms_a_named_set() {
+    let (mut s, a, b) = two_layers();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    s.execute("edit.transform", json!({"layers": [a.0, b.0], "matrix": [1.0, 0.0, 0.0, 1.0, 5.0, 5.0]})).unwrap();
+    let bounds = |s: &Session, id: LayerId| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().content_bounds();
+    assert_eq!(bounds(&s, a), Rect::new(15, 15, 35, 25));
+    assert_eq!(bounds(&s, b), Rect::new(65, 65, 95, 95), "the unselected named layer moved too");
+}
+
+/// The Background never joins a set: refused before anything is edited (a single-layer
+/// transform converts it instead).
+#[test]
+fn the_background_refuses_a_multi_transform() {
+    let (mut s, a, _b) = two_layers();
+    let bg = s.active().unwrap().doc.layers[0].id;
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    s.execute("layer.select", json!({"layer": bg.0, "mode": "add"})).unwrap();
+    let rev = s.active().unwrap().revision;
+    let err = s.execute("edit.transform", json!({"dx": 10})).unwrap_err().to_string();
+    assert!(err.contains("Background"), "{err}");
+    assert_eq!(s.active().unwrap().revision, rev, "the refusal changed nothing");
+}
+
+/// A position-locked layer refuses the whole set (#2585's rule extended), and nothing moves.
+#[test]
+fn a_locked_layer_refuses_the_whole_set() {
+    let (mut s, a, b) = two_layers();
+    s.execute("layer.setProps", json!({"layer": b.0, "locks": {"position": true}})).unwrap();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+    let err = s.execute("edit.transform", json!({"dx": 10})).unwrap_err().to_string();
+    assert!(err.contains("position-locked"), "{err}");
+    let st = s.active().unwrap();
+    assert_eq!(st.doc.layer(a).unwrap().surface().unwrap().content_bounds(), Rect::new(10, 10, 30, 20), "nothing moved");
+}
+
+/// A selection never clips a set: like the Move tool moving several layers whole, every
+/// layer moves in full, and the marching ants go with them (#7538's rule).
+#[test]
+fn a_selection_does_not_clip_a_multi_transform() {
+    let (mut s, a, b) = two_layers();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+    s.execute("select.rect", json!({"x": 20, "y": 15, "width": 30, "height": 10})).unwrap();
+    s.execute("edit.transform", json!({"dx": 10, "dy": 5})).unwrap();
+    let st = s.active().unwrap();
+    let bounds = |id: LayerId| st.doc.layer(id).unwrap().surface().unwrap().content_bounds();
+    assert_eq!(bounds(a), Rect::new(20, 15, 40, 25), "the whole layer moved; no hole where the unselected part was");
+    assert_eq!(bounds(b), Rect::new(70, 65, 100, 95), "the second moved with it, untouched by the selection");
+    assert_eq!(st.doc.selection.as_ref().unwrap().content_bounds(), Rect::new(30, 20, 60, 30), "the outline moves with the set");
+}
+
+/// Bad `layers` params are errors with the document untouched, never panics (Rule 9).
+#[test]
+fn bad_layers_params_are_graceful_errors() {
+    let (mut s, a, _b) = two_layers();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    let rev = s.active().unwrap().revision;
+    for p in [
+        json!({"layers": [], "dx": 10}),
+        json!({"layers": "Second", "dx": 10}),
+        json!({"layers": [999999], "dx": 10}),
+        json!({"layers": ["no such layer"], "dx": 10}),
+        json!({"layers": [a.0, "no such layer"], "dx": 10}),
+        json!({"layers": [{"bad": 1}], "dx": 10}),
+    ] {
+        assert!(s.execute("edit.transform", p.clone()).is_err(), "{p} must be refused");
+    }
+    assert_eq!(s.active().unwrap().revision, rev, "nothing ran");
+}
+
+/// Distort (a non-affine quad) over a set containing live type refuses the whole edit and
+/// leaves every layer intact, as the single-layer path refuses the type layer alone.
+#[test]
+fn distort_over_a_set_with_type_refuses_the_whole_edit() {
+    let (mut s, a, b) = two_layers();
+    s.execute("type.create", json!({"text": "Hi", "x": 20, "y": 20})).unwrap();
+    let t = s.active().unwrap().active_layer.unwrap();
+    s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+    for id in [b, t] {
+        s.execute("layer.select", json!({"layer": id.0, "mode": "add"})).unwrap();
+    }
+    let rev = s.active().unwrap().revision;
+    // A quad whose far row has a perspective term: not an affine.
+    let err = s.execute("edit.transform", json!({"quad": [[10, 10], [95, 15], [92, 92], [15, 90]]})).unwrap_err().to_string();
+    assert!(err.contains("rasterize"), "{err}");
+    assert_eq!(s.active().unwrap().revision, rev, "the refusal left every layer of the set alone");
+}

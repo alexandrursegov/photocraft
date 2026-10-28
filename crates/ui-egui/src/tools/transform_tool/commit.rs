@@ -67,7 +67,14 @@ pub fn commit(app: &mut PhotocraftApp) {
         if t.quad == corners(t.rect) {
             return; // untouched: nothing to do and no history step; a ⌥⌘T copy or a place stays
         }
-        let mut p = json!({"layer": t.layer, "rect": t.rect, "quad": t.quad, "interpolation": t.interpolation});
+        let mut p = json!({"rect": t.rect, "quad": t.quad, "interpolation": t.interpolation});
+        // A multi-layer box commits the set: the engine transforms every member by this one
+        // document-space map, in one history step.
+        if t.layers.len() > 1 {
+            p["layers"] = json!(t.layers);
+        } else {
+            p["layer"] = json!(t.layer);
+        }
         if let Some(target) = &t.target {
             p["target"] = target.clone();
         }
@@ -162,7 +169,7 @@ pub fn end_if_left(app: &mut PhotocraftApp) {
     if editing_placed_smart_object {
         app.ui.transform = None;
         app.transform_preview = None;
-    } else if switched_document || st.doc.layer(layer).is_none() {
+    } else if switched_document || st.doc.layer(layer).is_none() || t.layers.iter().any(|i| st.doc.layer(LayerId(*i)).is_none()) {
         cancel(app);
     } else if switched_away(app) {
         commit(app);
@@ -180,7 +187,14 @@ pub fn end_if_left(app: &mut PhotocraftApp) {
 /// opened: the session ends ([`end_if_left`], #1400).
 fn switched_away(app: &PhotocraftApp) -> bool {
     let (Some(t), Some(st)) = (&app.ui.transform, app.session.active()) else { return false };
-    app.transform_preview.as_ref().is_some_and(|pv| pv.tool != app.ui.tool) || (!t.selection && st.active_layer.is_some_and(|active| active.0 != t.layer))
+    app.transform_preview.as_ref().is_some_and(|pv| pv.tool != app.ui.tool)
+        || (!t.selection
+            && if t.layers.len() > 1 {
+                // The set is only its own: another layer picked, or the selection changed, ends it.
+                st.selected_layers().iter().map(|l| l.0).collect::<Vec<_>>() != t.layers
+            } else {
+                st.active_layer.is_some_and(|active| active.0 != t.layer)
+            })
 }
 
 /// Edits made while the box is open show in the preview at once, not only after the commit
@@ -192,6 +206,28 @@ pub fn follow_edits(app: &mut PhotocraftApp) {
     let (Some(t), Some(pv)) = (&app.ui.transform, app.transform_preview.as_mut()) else { return };
     let Some(follow) = pv.follow.as_mut() else { return };
     let Some(st) = app.session.active().filter(|st| st.doc.id == pv.doc.id && st.revision != follow.revision) else { return };
+    if t.layers.len() > 1 {
+        // The moving image is the set baked into one composite, and its snapshot stays in the
+        // preview document (the members hidden); under it the current document with the set
+        // removed, and the layers over its top composited again. Opacity is baked in, so it
+        // does not follow per-layer edits while the box is open.
+        let ids: Vec<LayerId> = t.layers.iter().map(|i| LayerId(*i)).collect();
+        let expanded = photocraft_engine::layer_multi_cmds::move_targets(&st.doc, &ids);
+        let mut pd = (*st.doc).clone();
+        for id in &expanded {
+            if let (Some(moving), Some(l)) = (pv.doc.layer(*id), pd.layer_mut(*id)) {
+                l.content = moving.content.clone();
+                l.visible = false;
+            }
+        }
+        if let (Some(a), Some(top)) = (pv.above.as_mut(), expanded.last()) {
+            a.rebuild(&st.doc, *top);
+            a.hide_in(&mut pd.layers);
+        }
+        follow.revision = st.revision;
+        pv.doc = Arc::new(pd);
+        return;
+    }
     let id = LayerId(t.layer);
     let (Some(live), Some(moving)) = (st.doc.layer(id), pv.doc.layer(id)) else { return };
     let mut pd = (*st.doc).clone();
@@ -289,7 +325,7 @@ pub(super) fn moves_type(app: &PhotocraftApp, t: &TransformSession) -> bool {
     !t.selection
         && t.target.is_none()
         && t.path.is_none()
-        && app.session.active().and_then(|st| st.doc.layer(LayerId(t.layer))).is_some_and(|l| matches!(l.content, LayerContent::Text(_)))
+        && app.session.active().is_some_and(|st| session_layers(t).iter().any(|id| st.doc.layer(*id).is_some_and(|l| matches!(l.content, LayerContent::Text(_)))))
 }
 
 /// Edit › Transform's Rotate and Flip presets while a box is open: what they do to the box, as

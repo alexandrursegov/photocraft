@@ -102,6 +102,16 @@ enum WarpDrag {
     Surface { s: f64, t: f64, start: [f64; 2], pts0: Vec<[f64; 2]> },
 }
 
+/// The layers a box moves: the multi-layer set's roots when it is one (the commit expands them
+/// with linked layers again), else the session's single layer.
+pub(crate) fn session_layers(t: &TransformSession) -> Vec<photocraft_doc::LayerId> {
+    if t.layers.len() > 1 {
+        t.layers.iter().map(|i| photocraft_doc::LayerId(*i)).collect()
+    } else {
+        vec![photocraft_doc::LayerId(t.layer)]
+    }
+}
+
 /// Preview state that isn't serialisable: the document without the transformed pixels, and
 /// full-resolution textures of those pixels (transform_tex.rs).
 pub struct TransformPreview {
