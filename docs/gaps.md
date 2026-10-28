@@ -256,6 +256,10 @@ what an agent can't finish alone.
 - **Estimate:** 100–180 h. **Human:** checking feel on real tablets.
 
 ### G5. Transform, handles and modifiers
+- **Progress (2026-10-28):** Multi-layer Free Transform: with several layers selected, ⌘T, Edit ›
+  Transform and `edit.transform` box and commit the whole set as one, in one history step, keeping
+  type, shapes and smart objects live (`transform_tool::begin_multi`; the command gained
+  `"layers"`). Shared-frame handles, Warp, Content-Aware Scale and the ⌥⌘T copy stay single-layer.
 - **Missing:** the full interpolation list; blend mode/opacity edits during
   a transform (#1384); path-point nudge; autoscroll at the edge while selecting (#2231);
   wheel and pinch behaviour (#2485, #2463, #1989);

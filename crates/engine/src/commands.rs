@@ -347,10 +347,16 @@ fn set_clipped(s: &mut Session, p: &Value, clip: bool) -> Result<Value> {
 /// `"background"` finds the Background). `None` when the param is absent.
 pub(crate) fn explicit_layer(s: &Session, p: &Value) -> Result<Option<LayerId>> {
     match p.get("layer") {
-        Some(Value::Number(n)) => {
-            n.as_u64().map(|id| Some(LayerId(id))).ok_or_else(|| EngineError::Other(format!("layer id {n} is not a non-negative integer")))
-        }
-        Some(Value::String(name)) => {
+        Some(Value::Null) | None => Ok(None),
+        Some(v) => Ok(Some(layer_value(s, v)?)),
+    }
+}
+
+/// The [`explicit_layer`] resolution for one parameter value: an id or a name.
+pub(crate) fn layer_value(s: &Session, v: &Value) -> Result<LayerId> {
+    match v {
+        Value::Number(n) => n.as_u64().map(LayerId).ok_or_else(|| EngineError::Other(format!("layer id {n} is not a non-negative integer"))),
+        Value::String(name) => {
             let d = s.active().ok_or(EngineError::NoDocument)?;
             let layers = d.doc.walk();
             let mut top_down = layers.iter().rev();
@@ -358,11 +364,10 @@ pub(crate) fn explicit_layer(s: &Session, p: &Value) -> Result<Option<LayerId>> 
                 .clone()
                 .find(|(_, _, l)| l.name == *name)
                 .or_else(|| top_down.find(|(_, _, l)| l.name.to_lowercase() == name.to_lowercase()))
-                .map(|(_, _, l)| Some(l.id))
+                .map(|(_, _, l)| l.id)
                 .ok_or_else(|| EngineError::Other(format!("no layer named \"{name}\"; {}", layer_listing(&d.doc))))
         }
-        Some(Value::Null) | None => Ok(None),
-        Some(other) => Err(EngineError::Other(format!("`layer` must be an id or a name, not {other}"))),
+        other => Err(EngineError::Other(format!("`layer` must be an id or a name, not {other}"))),
     }
 }
 

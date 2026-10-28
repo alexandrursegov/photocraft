@@ -57,7 +57,7 @@ fn framed_by_selection(doc: &Document, bounds: Rect) -> Rect {
 }
 
 /// A group moves all its descendants, so its frame must not clip raster children to the selection.
-pub(crate) fn whole_layer_bounds(doc: &Document, layer: &Layer) -> Rect {
+pub fn whole_layer_bounds(doc: &Document, layer: &Layer) -> Rect {
     let content = match &layer.content {
         LayerContent::Group(g) => g.children.iter().map(|c| whole_layer_bounds(doc, c)).fold(Rect::EMPTY, |a, b| a.union(&b)),
         // A soft shape (Density below 100 % or a Feather) renders past its path, over the whole
@@ -741,22 +741,131 @@ fn with_panel_target(s: &Session, p: &Value) -> Value {
     p
 }
 
+/// The `rect` param: an explicit source frame; `None` when absent or malformed (the caller then
+/// takes the frame from the layers, as before).
+fn rect_param(p: &Value) -> Option<[f64; 4]> {
+    let r = p.get("rect").and_then(Value::as_array)?;
+    if r.len() != 4 {
+        return None;
+    }
+    let v: Vec<f64> = r.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
+    Some([v[0], v[1], v[2], v[3]])
+}
+
+/// The map `p` describes against the source frame `rect`: exactly one of the `quad` (where the
+/// frame's corners go), `matrix`, or the relative `scaleX`/`scaleY`/`rotate`/`dx`/`dy` keys.
+fn homography(p: &Value, rect: [f64; 4]) -> Result<Homography> {
+    if let Some(q) = quad_param(p) {
+        Homography::rect_to_quad(rect, q).ok_or_else(|| bad("degenerate quad"))
+    } else if let Some(m) = p.get("matrix").and_then(Value::as_array) {
+        let v: Vec<f64> = m.iter().filter_map(Value::as_f64).collect();
+        if v.len() != 6 {
+            return Err(bad("matrix must be [a, b, c, d, e, f]"));
+        }
+        // Affine [a b c d e f] maps (x, y) → (a·x + c·y + e, b·x + d·y + f).
+        Ok(Homography([v[0], v[2], v[4], v[1], v[3], v[5], 0.0, 0.0, 1.0]))
+    } else if let Some(m) = relative_matrix(p, rect)? {
+        Ok(m)
+    } else {
+        Err(bad("pass `quad` (where the rect's corners go), `matrix`, or `scaleX`/`scaleY`/`rotate`/`dx`/`dy`"))
+    }
+}
+
+/// The affine behind `h` when its last row is the plain one (Distort and Perspective have none).
+fn affine_of(h: &Homography) -> Option<Affine> {
+    let m = h.0;
+    (m[6].abs() < 1e-12 && m[7].abs() < 1e-12).then(|| Affine { m: [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]] })
+}
+
+/// The `layers` param: ids or names transformed together in one box.
+fn layers_param(s: &Session, p: &Value) -> Result<Option<Vec<LayerId>>> {
+    match p.get("layers") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => {
+            if a.is_empty() {
+                return Err(bad("`layers` must name at least one layer"));
+            }
+            let mut ids = Vec::with_capacity(a.len());
+            for v in a {
+                ids.push(crate::commands::layer_value(s, v)?);
+            }
+            Ok(Some(ids))
+        }
+        Some(other) => Err(bad(format!("`layers` must be an array of ids or names, not {other}"))),
+    }
+}
+
 fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     let p = &with_panel_target(s, p);
     let st = s.active().ok_or(EngineError::NoDocument)?;
-    let id = crate::commands::explicit_layer(s, p)?.or(st.active_layer);
+    let explicit = crate::commands::explicit_layer(s, p)?;
+    let listed = layers_param(s, p)?;
+    let id = explicit.or_else(|| listed.as_ref().filter(|l| l.len() == 1).and_then(|l| l.first()).copied()).or(st.active_layer);
     let lone = lone_target(&st.doc, id, p)?;
+    // Several layers named by `layers`, or (with neither param) several selected layers, transform
+    // as one set under one document-space map, as Photoshop's multi-layer Free Transform and the
+    // Move tool do. A lone mask or channel target keeps the single-layer path.
+    let multi = if lone.is_some() {
+        Vec::new()
+    } else if let Some(l) = listed.filter(|l| l.len() > 1) {
+        l
+    } else if explicit.is_none() {
+        let sel = st.selected_layers();
+        if sel.len() > 1 { sel } else { Vec::new() }
+    } else {
+        Vec::new()
+    };
+    if !multi.is_empty() {
+        let mut multi = multi;
+        // Every named layer has to exist, and the whole set must be transformable before
+        // anything starts: a locked or Background root refuses the transform (#2585's rule,
+        // extended to the set; the single-layer path converts its own Background instead).
+        for id in &multi {
+            let l = st.doc.layer(*id).ok_or(EngineError::NoLayer(*id))?;
+            if st.doc.is_background(*id) {
+                return Err(EngineError::Other(format!("layer \"{}\" is the Background: convert it to a layer to transform it with others", l.name)));
+            }
+            if locked_for_transform(&st.doc, *id) {
+                return Err(EngineError::Other(format!("layer \"{}\" is position-locked", l.name)));
+            }
+        }
+        let rect = rect_param(p).unwrap_or_else(|| {
+            // The set's frame: every member whole. A selection clips a single pixel layer's
+            // transform, never a set (`transform_frame` would frame each member by the selection).
+            let b = multi
+                .iter()
+                .filter_map(|id| st.doc.layer(*id))
+                .map(|l| whole_layer_bounds(&st.doc, l))
+                .fold(Rect::EMPTY, |a, b| if a.is_empty() { b } else { a.union(&b) });
+            [b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64]
+        });
+        if rect[0] >= rect[2] || rect[1] >= rect[3] {
+            return Err(EngineError::Other("nothing to transform".into()));
+        }
+        let h = homography(p, rect)?;
+        if h.inverse().is_none() {
+            return Err(bad("the transform collapses the layer"));
+        }
+        let affine = affine_of(&h);
+        let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
+        multi.sort_by_key(|id| id.0);
+        multi.dedup();
+        let ids = multi;
+        return crate::jobs::edit_job(
+            s,
+            "Free Transform",
+            move |doc, _, ctx| ctx.stage(0.0, 1.0, "Transforming", |ctl| transform_layers_doc(doc, &ids, &h, affine, interp, ctl)),
+            move |()| json!({"rect": rect}),
+        );
+    }
     let id = match (id, lone.is_some() && crate::channel_cmds::is_channel_target(p)) {
         (_, true) => None,
         (Some(id), false) => Some(id),
         (None, false) => return Err(EngineError::Other("no active layer".into())),
     };
-    let rect = match p.get("rect").and_then(Value::as_array) {
-        Some(r) if r.len() == 4 => {
-            let v: Vec<f64> = r.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
-            [v[0], v[1], v[2], v[3]]
-        }
-        _ => {
+    let rect = match rect_param(p) {
+        Some(r) => r,
+        None => {
             let b = match (lone, id) {
                 (Some(surf), _) => target_bounds(&st.doc, surf),
                 (None, Some(id)) => transform_bounds(&st.doc, st.doc.layer(id).ok_or(EngineError::NoLayer(id))?),
@@ -768,26 +877,11 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
             [b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64]
         }
     };
-    let h = if let Some(q) = quad_param(p) {
-        Homography::rect_to_quad(rect, q).ok_or_else(|| bad("degenerate quad"))?
-    } else if let Some(m) = p.get("matrix").and_then(Value::as_array) {
-        let v: Vec<f64> = m.iter().filter_map(Value::as_f64).collect();
-        if v.len() != 6 {
-            return Err(bad("matrix must be [a, b, c, d, e, f]"));
-        }
-        // Affine [a b c d e f] maps (x, y) → (a·x + c·y + e, b·x + d·y + f).
-        Homography([v[0], v[2], v[4], v[1], v[3], v[5], 0.0, 0.0, 1.0])
-    } else if let Some(m) = relative_matrix(p, rect)? {
-        m
-    } else {
-        return Err(bad("pass `quad` (where the rect's corners go), `matrix`, or `scaleX`/`scaleY`/`rotate`/`dx`/`dy`"));
-    };
+    let h = homography(p, rect)?;
     if h.inverse().is_none() {
         return Err(bad("the transform collapses the layer"));
     }
-    let m = h.0;
-    let affine =
-        (m[6].abs() < 1e-12 && m[7].abs() < 1e-12).then(|| Affine { m: [m[0] / m[8], m[3] / m[8], m[1] / m[8], m[4] / m[8], m[2] / m[8], m[5] / m[8]] });
+    let affine = affine_of(&h);
     let interp = Interp::parse(p.get("interpolation").and_then(Value::as_str).unwrap_or("bicubic"));
     let lone = lone.is_some();
     let p = p.clone();
@@ -799,6 +893,50 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
         move |doc, _, ctx| ctx.stage(0.0, 1.0, "Transforming", |ctl| transform_doc(doc, id, &p, lone, &h, affine, interp, ctl)),
         move |()| json!({"rect": rect}),
     )
+}
+
+/// The edit of [`transform`] over several roots as one set: the same document-space map applied to
+/// every layer of the set whole, plus their linked layers and group contents (`move_targets`, the
+/// set `layer.translate` moves). Several layers always move whole: the selection clips a single
+/// pixel layer's transform, never a set (the Move tool's rule, #7538). One job, so one history
+/// step takes the whole set back.
+fn transform_layers_doc(doc: &mut Document, roots: &[LayerId], h: &Homography, affine: Option<Affine>, interp: Interp, ctl: &Interrupt) -> Result<()> {
+    if h.is_identity() {
+        return Ok(());
+    }
+    // The selection outline moves too: price it before anything is built.
+    if let Some(sel) = doc.selection.as_ref() {
+        check_budget(sel.content_bounds(), h, "selection", sel.format())?;
+    }
+    let ids = crate::layer_multi_cmds::move_targets(doc, roots);
+    if ids.is_empty() {
+        return Err(EngineError::Other("nothing to transform".into()));
+    }
+    for id in &ids {
+        let l = doc.layer(*id).ok_or(EngineError::NoLayer(*id))?;
+        check_layer_budget(None, l, h)?;
+    }
+    let before = doc.clone();
+    let mut taken = Vec::new();
+    for id in &ids {
+        let group = group_locks(doc, *id);
+        let l = doc.layer_mut(*id).ok_or(EngineError::NoLayer(*id))?;
+        taken.extend(crate::smart_cmds::take_caches(std::slice::from_mut(l)));
+        apply_transform(None, group, l, h, affine, interp, ctl)?;
+    }
+    // Type, shape and smart layers re-render from their new transform, every kind from the same
+    // pre-edit snapshot (each refresh reads only its own layer's content).
+    for id in &ids {
+        if let Some(l) = doc.layer_mut(*id) {
+            refresh_text(&before, l);
+        }
+    }
+    crate::smart_cmds::restore_unrendered(doc, taken, |c| warp_surface(c, c.content_bounds(), h, interp))?;
+    // The selection outline moves with the pixels.
+    if let Some(sel) = &doc.selection {
+        doc.selection = Some(warp_gray(sel, h, Interp::Bilinear)?).filter(|s| !s.content_bounds().is_empty());
+    }
+    Ok(())
 }
 
 /// The edit of [`transform`]: the layer (or a lone mask or channel) and the selection outline.
@@ -865,7 +1003,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Free Transform",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"rect":[x0,y0,x1,y1]? (source frame; default = layer content ∩ selection),"quad":[[x,y]×4]? (where the frame's corners go, clockwise from top-left),"matrix":[a,b,c,d,e,f]? (affine alternative),"scaleX":%?,"scaleY":%?,"rotate":deg?,"dx":px?,"dy":px? (relative alternative: scale and rotate about the frame's centre, then move, as a Photoshop action records a Free Transform),"interpolation":"bicubic|bilinear|nearest|bicubicSharper|bicubicSmoother|bicubicAutomatic"="bicubic" (Photoshop's bicubic variants render as Bicubic),"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target (an unlinked mask, an alpha channel or the Quick Mask transforms alone; a linked mask moves with its layer)}"##,
+        params: r##"{"layer":id?,"layers":[id|name,…]? (transform every named layer together in one box, as one history step; with neither `layer` nor `layers` and several layers selected, all of them move whole together, like the Move tool; a locked layer or the Background in the set refuses the transform),"rect":[x0,y0,x1,y1]? (source frame; default = the layer content ∩ selection, or the union of the set's frames),"quad":[[x,y]×4]? (where the frame's corners go, clockwise from top-left),"matrix":[a,b,c,d,e,f]? (affine alternative),"scaleX":%?,"scaleY":%?,"rotate":deg?,"dx":px?,"dy":px? (relative alternative: scale and rotate about the frame's centre, then move, as a Photoshop action records a Free Transform),"interpolation":"bicubic|bilinear|nearest|bicubicSharper|bicubicSmoother|bicubicAutomatic"="bicubic" (Photoshop's bicubic variants render as Bicubic),"target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target (an unlinked mask, an alpha channel or the Quick Mask transforms alone; a linked mask moves with its layer)}"##,
         enabled: has_layer,
         journal: true,
         run: transform,
@@ -1783,5 +1921,134 @@ mod tests {
             s.execute("layer.vectorMask.edit", json!({"density": 100, "feather": 8})).unwrap();
             assert_eq!(boxes(&s), hard, "{align} at {x}: Feather alone leaves the frame");
         }
+    }
+
+    // ---- Multi-layer Free Transform: several layers, one box, one history step. ----
+
+    /// [`session`] plus a second painted layer: the first at (10,10)-(30,20), the second at
+    /// (60,60)-(90,90). Returns the session and both layer ids.
+    fn two_layers() -> (Session, LayerId, LayerId) {
+        let mut s = session();
+        s.execute("layer.new.layer", json!({"name": "Second"})).unwrap();
+        s.edit("paint", |doc, active| {
+            doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap().fill_rect(Rect::new(60, 60, 90, 90), &[0.0, 0.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        let (a, b) = {
+            let st = s.active().unwrap();
+            (st.doc.layers[1].id, st.doc.layers[2].id)
+        };
+        (s, a, b)
+    }
+
+    /// Several selected layers scale by the same map about the union frame's centre, as
+    /// Photoshop's multi-layer Free Transform does, and the whole set takes one history step.
+    #[test]
+    fn several_selected_layers_transform_as_one_step() {
+        let (mut s, a, b) = two_layers();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        let past = s.active().unwrap().history.past_len();
+        s.execute("edit.transform", json!({"scaleX": 200, "scaleY": 200})).unwrap();
+        let bounds = |s: &Session, id: LayerId| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().content_bounds();
+        assert_eq!(s.active().unwrap().history.past_len(), past + 1, "one history step for the set");
+        // Union frame (10,10)-(90,90), centre (50,50): x' = 50 + 2·(x - 50).
+        assert_eq!(bounds(&s, a), Rect::new(-30, -30, 10, -10), "the first layer scaled about the shared centre");
+        assert_eq!(bounds(&s, b), Rect::new(70, 70, 130, 130), "the second moved with it");
+        assert!(s.undo());
+        assert_eq!(bounds(&s, a), Rect::new(10, 10, 30, 20), "one undo takes both layers back");
+        assert_eq!(bounds(&s, b), Rect::new(60, 60, 90, 90));
+    }
+
+    /// `"layers"` transforms the named set even while only one of them is selected.
+    #[test]
+    fn the_layers_param_transforms_a_named_set() {
+        let (mut s, a, b) = two_layers();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        s.execute("edit.transform", json!({"layers": [a.0, b.0], "matrix": [1.0, 0.0, 0.0, 1.0, 5.0, 5.0]})).unwrap();
+        let bounds = |s: &Session, id: LayerId| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().content_bounds();
+        assert_eq!(bounds(&s, a), Rect::new(15, 15, 35, 25));
+        assert_eq!(bounds(&s, b), Rect::new(65, 65, 95, 95), "the unselected named layer moved too");
+    }
+
+    /// The Background never joins a set: refused before anything is edited (a single-layer
+    /// transform converts it instead).
+    #[test]
+    fn the_background_refuses_a_multi_transform() {
+        let (mut s, a, _b) = two_layers();
+        let bg = s.active().unwrap().doc.layers[0].id;
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        s.execute("layer.select", json!({"layer": bg.0, "mode": "add"})).unwrap();
+        let rev = s.active().unwrap().revision;
+        let err = s.execute("edit.transform", json!({"dx": 10})).unwrap_err().to_string();
+        assert!(err.contains("Background"), "{err}");
+        assert_eq!(s.active().unwrap().revision, rev, "the refusal changed nothing");
+    }
+
+    /// A position-locked layer refuses the whole set (#2585's rule extended), and nothing moves.
+    #[test]
+    fn a_locked_layer_refuses_the_whole_set() {
+        let (mut s, a, b) = two_layers();
+        s.execute("layer.setProps", json!({"layer": b.0, "locks": {"position": true}})).unwrap();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        let err = s.execute("edit.transform", json!({"dx": 10})).unwrap_err().to_string();
+        assert!(err.contains("position-locked"), "{err}");
+        let st = s.active().unwrap();
+        assert_eq!(st.doc.layer(a).unwrap().surface().unwrap().content_bounds(), Rect::new(10, 10, 30, 20), "nothing moved");
+    }
+
+    /// A selection never clips a set: like the Move tool moving several layers whole, every
+    /// layer moves in full, and the marching ants go with them (#7538's rule).
+    #[test]
+    fn a_selection_does_not_clip_a_multi_transform() {
+        let (mut s, a, b) = two_layers();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+        s.execute("select.rect", json!({"x": 20, "y": 15, "width": 30, "height": 10})).unwrap();
+        s.execute("edit.transform", json!({"dx": 10, "dy": 5})).unwrap();
+        let st = s.active().unwrap();
+        let bounds = |id: LayerId| st.doc.layer(id).unwrap().surface().unwrap().content_bounds();
+        assert_eq!(bounds(a), Rect::new(20, 15, 40, 25), "the whole layer moved; no hole where the unselected part was");
+        assert_eq!(bounds(b), Rect::new(70, 65, 100, 95), "the second moved with it, untouched by the selection");
+        assert_eq!(st.doc.selection.as_ref().unwrap().content_bounds(), Rect::new(30, 20, 60, 30), "the outline moves with the set");
+    }
+
+    /// Bad `layers` params are errors with the document untouched, never panics (Rule 9).
+    #[test]
+    fn bad_layers_params_are_graceful_errors() {
+        let (mut s, a, _b) = two_layers();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        let rev = s.active().unwrap().revision;
+        for p in [
+            json!({"layers": [], "dx": 10}),
+            json!({"layers": "Second", "dx": 10}),
+            json!({"layers": [999999], "dx": 10}),
+            json!({"layers": ["no such layer"], "dx": 10}),
+            json!({"layers": [a.0, "no such layer"], "dx": 10}),
+            json!({"layers": [{"bad": 1}], "dx": 10}),
+        ] {
+            assert!(s.execute("edit.transform", p.clone()).is_err(), "{p} must be refused");
+        }
+        assert_eq!(s.active().unwrap().revision, rev, "nothing ran");
+    }
+
+    /// Distort (a non-affine quad) over a set containing live type refuses the whole edit and
+    /// leaves every layer intact, as the single-layer path refuses the type layer alone.
+    #[test]
+    fn distort_over_a_set_with_type_refuses_the_whole_edit() {
+        let (mut s, a, b) = two_layers();
+        s.execute("type.create", json!({"text": "Hi", "x": 20, "y": 20})).unwrap();
+        let t = s.active().unwrap().active_layer.unwrap();
+        s.execute("layer.select", json!({"layer": a.0, "mode": "replace"})).unwrap();
+        for id in [b, t] {
+            s.execute("layer.select", json!({"layer": id.0, "mode": "add"})).unwrap();
+        }
+        let rev = s.active().unwrap().revision;
+        // A quad whose far row has a perspective term: not an affine.
+        let err = s.execute("edit.transform", json!({"quad": [[10, 10], [95, 15], [92, 92], [15, 90]]})).unwrap_err().to_string();
+        assert!(err.contains("rasterize"), "{err}");
+        assert_eq!(s.active().unwrap().revision, rev, "the refusal left every layer of the set alone");
     }
 }

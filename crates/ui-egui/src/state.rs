@@ -1125,6 +1125,11 @@ impl TransformMode {
 pub struct TransformSession {
     pub session: u64,
     pub layer: u64,
+    /// Multi-layer Free Transform (Photoshop's several selected layers): every root of the set,
+    /// in stack order. Commit passes them as `edit.transform`'s `"layers"`, which the engine
+    /// expands with linked layers and group children like the Move tool. Empty: the single `layer`.
+    #[serde(default)]
+    pub layers: Vec<u64>,
     pub rect: [f64; 4],
     /// Corners clockwise from top-left (document px).
     pub quad: [[f64; 2]; 4],
